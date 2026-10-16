@@ -14,6 +14,10 @@ Building on Soroban requires careful resource management. Sky Moon Scope provide
 - `/contracts`: Sample Soroban contracts used for benchmarking.
 - `/.github/workflows`: CI/CD pipelines.
 
+### Large pull requests
+
+The **Large PR warning** workflow comments on pull requests whose combined additions and deletions exceed 800 lines. Repositories can override this default by setting the `PR_DIFF_WARNING_THRESHOLD` Actions variable to a non-negative integer. The workflow updates its existing warning as a pull request changes and removes it if the diff falls back below the limit.
+
 ## ⚙️ Getting Started
 
 ### Prerequisites
@@ -38,6 +42,7 @@ The **core** crate is a Rust binary that will power Sky Moon Scope's resource pr
 - **Gas Golfing Analysis**: Automated detection of gas-heavy patterns with optimization suggestions
 - **Contract Simulation**: Test contract functions with various inputs
 - **Fee Market Analysis**: Real-time fee predictions and market conditions
+- **Soroban Metadata Decoder**: Decodes `contractmetav0` and `contractspecv0` WASM custom sections into structured ABI and build metadata
 
 ### Build & Run
 ```bash
@@ -101,9 +106,10 @@ The **web** app is a Next.js + Tailwind CSS dashboard for exploring resource usa
 - **Client-Side Simulation Rate Limiting**: Throttles contract simulation requests to a maximum of 2 calls per second via `RequestQueueManager` to prevent hitting Soroban RPC rate limits (429/503).
 - **Infinite Scroll Telemetry Logs**: Smooth `IntersectionObserver`-based infinite scrolling for browsing historical telemetry logs and transaction records.
 - **Subgraph Schema Visualizer**: Interactive React Flow node diagram of cross-contract calls and the ledger keys each invocation reads or writes (**Schema** tab).
-- **Global Search (`Cmd+K` / `Ctrl+K`)**: Quick-search overlay for jumping to any panel, page or contract function from anywhere in the app.
+- **Global Search (`Cmd+K` / `Ctrl+K`)**: Quick-search overlay for jumping to any panel, page or contract function from anywhere in the app. Recently visited panels surface automatically when the query is empty, and contract function results include inline parameter type signatures so you can search by type (`u128`, `address`) or parameter name.
 - **Custom Endpoints**: `/settings` stores a self-hosted Soroban RPC and indexer URL in LocalStorage, with a connection test for each.
 - **Off-Thread WASM Decoding**: Uploaded bytecode is decoded and validated in a dedicated Web Worker, so large contracts never freeze the UI.
+- **Soroban Metadata Decoding**: Displays ABI signatures, documentation, parameter types, custom types, and build metadata decoded from `contractspecv0` and `contractmetav0`.
 
 See [docs/FRONTEND_FEATURES.md](docs/FRONTEND_FEATURES.md) for details.
 

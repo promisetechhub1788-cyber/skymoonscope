@@ -92,6 +92,41 @@ test('calculateStakingYield: handles negative inputs and boundary clamping', () 
   assert.equal(negativeDeposit.totalBalance, 0);
 });
 
+test('getDurationTierMultiplier: interpolates smoothly between 24 and 36 months (slider stepping fix)', () => {
+  // Regression test for: slider stepping inconsistency above 24 months.
+  // Previously 25-36 all returned flat 2.0 (a +0.25 jump at 24->25, then zero
+  // change per slider step). Now every 1-month step adds 0.25/12.
+  const step = 0.25 / 12;
+  assert.ok(Math.abs(getDurationTierMultiplier(25) - (1.75 + step)) < 1e-12);
+  assert.ok(Math.abs(getDurationTierMultiplier(30) - 1.875) < 1e-12);
+  assert.ok(Math.abs(getDurationTierMultiplier(36) - 2.0) < 1e-12);
+
+  // Uniform per-month delta across the whole 24-36 slider range
+  for (let m = 25; m <= 36; m++) {
+    const delta = getDurationTierMultiplier(m) - getDurationTierMultiplier(m - 1);
+    assert.ok(Math.abs(delta - step) < 1e-12, `month ${m - 1}->${m} delta ${delta} !== ${step}`);
+  }
+
+  // Clamps at 2.0 beyond the 36-month slider max
+  assert.equal(getDurationTierMultiplier(37), 2.0);
+  assert.equal(getDurationTierMultiplier(100), 2.0);
+});
+
+test('calculateStakingYield: every slider step above 24 months increases rewards', () => {
+  let prevInterest = -Infinity;
+  for (let m = 24; m <= 36; m++) {
+    const r = calculateStakingYield({
+      depositAmount: 1000,
+      lockDurationMonths: m,
+      baseApyPercentage: 10,
+      compoundFrequency: 'monthly',
+      enableTierMultiplier: true,
+    });
+    assert.ok(r.totalInterest > prevInterest, `month ${m} interest ${r.totalInterest} should exceed ${prevInterest}`);
+    prevInterest = r.totalInterest;
+  }
+});
+
 test('calculateStakingYield: monthly breakdown matches final balance', () => {
   const result = calculateStakingYield({
     depositAmount: 2000,

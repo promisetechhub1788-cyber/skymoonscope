@@ -1,5 +1,6 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { calculateStakingYield } from '../lib/stakingCalculator';
+import { CompoundInterestChart } from './CompoundInterestChart';
 import { Calculator, TrendingUp, Calendar, Zap, DollarSign, RefreshCw, BarChart2 } from 'lucide-react';
 
 export interface StakingCalculatorProps {
@@ -7,6 +8,8 @@ export interface StakingCalculatorProps {
   initialDurationMonths?: number;
   initialBaseApy?: number;
   className?: string;
+  stakeLockWarningThreshold?: number;
+  onStakeLockWarningChange?: (showWarning: boolean) => void;
 }
 
 export function StakingCalculator({
@@ -14,9 +17,13 @@ export function StakingCalculator({
   initialDurationMonths = 12,
   initialBaseApy = 12,
   className = '',
+  stakeLockWarningThreshold,
+  onStakeLockWarningChange,
 }: StakingCalculatorProps) {
   const [depositAmount, setDepositAmount] = useState<number>(initialDeposit);
-  const [lockDurationMonths, setLockDurationMonths] = useState<number>(initialDurationMonths);
+  const [lockDurationMonths, setLockDurationMonths] = useState<number>(() =>
+    Math.min(36, Math.max(1, Math.round(initialDurationMonths))),
+  );
   const [baseApyPercentage, setBaseApyPercentage] = useState<number>(initialBaseApy);
   const [compoundFrequency, setCompoundFrequency] = useState<string>('monthly');
   const [enableTierMultiplier, setEnableTierMultiplier] = useState<boolean>(true);
@@ -29,8 +36,15 @@ export function StakingCalculator({
       compoundFrequency,
       baseApyPercentage,
       enableTierMultiplier,
+      stakeLockWarningThreshold,
     });
-  }, [depositAmount, lockDurationMonths, compoundFrequency, baseApyPercentage, enableTierMultiplier]);
+  }, [depositAmount, lockDurationMonths, compoundFrequency, baseApyPercentage, enableTierMultiplier, stakeLockWarningThreshold]);
+
+  useEffect(() => {
+    if (onStakeLockWarningChange) {
+      onStakeLockWarningChange(results.showStakeLockWarning);
+    }
+  }, [results.showStakeLockWarning, onStakeLockWarningChange]);
 
   const presetAmounts = [500, 1000, 5000, 10000, 50000];
   const presetDurations = [
@@ -55,9 +69,17 @@ export function StakingCalculator({
             Estimate projected APY, compounding returns, and rewards prior to locking your tokens.
           </p>
         </div>
-        <div className="inline-flex items-center gap-2 rounded-full border border-cyan-500/30 bg-cyan-950/40 px-3 py-1 text-xs font-semibold text-cyan-400">
-          <Zap className="h-3.5 w-3.5" />
-          <span>Soroban Staking</span>
+        <div className="flex flex-col items-end gap-2 sm:flex-row sm:items-center">
+          {results.showStakeLockWarning && (
+            <div className="inline-flex items-center gap-2 rounded-full border border-amber-500/30 bg-amber-950/40 px-3 py-1 text-xs font-semibold text-amber-400">
+              <AlertTriangle className="h-3.5 w-3.5" />
+              <span>Stake Lock Warning: Estimated returns below threshold</span>
+            </div>
+          )}
+          <div className="inline-flex items-center gap-2 rounded-full border border-cyan-500/30 bg-cyan-950/40 px-3 py-1 text-xs font-semibold text-cyan-400">
+            <Zap className="h-3.5 w-3.5" />
+            <span>Soroban Staking</span>
+          </div>
         </div>
       </div>
 
@@ -130,7 +152,17 @@ export function StakingCalculator({
               max="36"
               step="1"
               value={lockDurationMonths}
-              onChange={(e) => setLockDurationMonths(Number(e.target.value))}
+              onChange={(e) => {
+                // Keep stepping uniform (1 month) across the full 1-36 range,
+                // including above 24 months: round + clamp so the slider can
+                // never land on fractional or out-of-range values.
+                const next = Math.round(Number(e.target.value));
+                setLockDurationMonths(Math.min(36, Math.max(1, next)));
+              }}
+              aria-valuemin={1}
+              aria-valuemax={36}
+              aria-valuenow={lockDurationMonths}
+              aria-valuetext={`${lockDurationMonths} months`}
               className="h-2 w-full cursor-pointer appearance-none rounded-lg bg-slate-800 accent-cyan-400"
             />
             {/* Duration Presets */}
@@ -306,6 +338,11 @@ export function StakingCalculator({
             </button>
           </div>
         </div>
+      </div>
+
+      {/* Compound Interest Growth Chart */}
+      <div className="mt-6 border-t border-slate-800 pt-5">
+        <CompoundInterestChart result={results} />
       </div>
 
       {/* Monthly Milestone Table */}

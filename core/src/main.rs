@@ -1,4 +1,3 @@
-```rust
 #![allow(dead_code)]
 
 mod auth;
@@ -6,6 +5,7 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod error_middleware;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -59,6 +59,7 @@ use axum::{
 use config::{Config, ConfigError};
 use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
 use std::collections::HashMap;
 use std::env;
@@ -82,7 +83,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct AppConfig {
     /// Port for the HTTP server
@@ -168,6 +169,9 @@ struct AppConfig {
     /// L2 treats it as stale. Default 100 ≈ 8 minutes at 5 s/ledger.
     #[serde(default = "default_max_ledger_age")]
     max_ledger_age: u32,
+    /// Maximum on-disk simulation cache size in megabytes (default 100).
+    #[serde(default = "default_max_cache_size_mb")]
+    max_cache_size_mb: u64,
     /// Comma-separated list of origins the CORS layer allows on the public
     /// API routes (issue #670). Empty means any origin — development fallback.
     #[serde(default)]
@@ -186,6 +190,15 @@ struct AppConfig {
     /// When empty, defaults to `*` (allow all origins).
     #[serde(default = "default_allowed_origins")]
     allowed_origins: String,
+    /// Minimum number of seconds between two alerts for the same host
+    /// resource (issue #24).
+    ///
+    /// The system resource alarm monitor is edge-triggered, so without a
+    /// window a resource oscillating around the alarm threshold alerts on
+    /// every sampling interval. `0` disables rate limiting.
+    /// Env: `ALARM_DEDUP_WINDOW_SECS`. Default 60.
+    #[serde(default = "default_alarm_dedup_window_secs")]
+    alarm_dedup_window_secs: u64,
 }
 
 fn default_health_check_interval() -> u64 {
@@ -250,13 +263,48 @@ fn default_max_ledger_age() -> u32 {
     100
 }
 
+fn default_max_cache_size_mb() -> u64 {
+    100
+}
+
 fn default_event_bus_capacity() -> usize {
     256
+}
+
+/// Default alert deduplication window in seconds (issue #24).
+///
+/// Mirrors `config::default_alarm_dedup_window_secs()` so the binary and the
+/// library config surface agree on a single default.
+fn default_alarm_dedup_window_secs() -> u64 {
+    60
+}
+
 fn default_allowed_origins() -> String {
     // Empty string means: fall back to allow-all (*).
     // Operators set ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com
     // in their environment to restrict access.
     String::new()
+}
+
+fn redacted_config(config: &AppConfig) -> Value {
+    let mut value = serde_json::to_value(config).expect("AppConfig should serialize");
+    redact_sensitive_values(&mut value);
+    value
+}
+
+fn redact_sensitive_values(value: &mut Value) {
+    if let Value::Object(fields) = value {
+        for (name, value) in fields.iter_mut() {
+            if ["_KEY", "_SECRET", "_PASSWORD", "_URL"]
+                .iter()
+                .any(|suffix| name.to_ascii_uppercase().ends_with(suffix))
+            {
+                *value = Value::String("[REDACTED]".to_string());
+            } else {
+                redact_sensitive_values(value);
+            }
+        }
+    }
 }
 
 fn load_config() -> Result<AppConfig, ConfigError> {
@@ -288,8 +336,15 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("emergency_verification_paused", false)?
         .set_default("disk_cache_path", "")?
         .set_default("max_ledger_age", 100)?
+        .set_default("max_cache_size_mb", 100)?
         .set_default("cors_allowed_origins", "")?
         .set_default("event_bus_capacity", 256)?
+        // Issue #24: alert deduplication window, resolved at alarm-manager
+        // initialisation below.
+        .set_default(
+            "alarm_dedup_window_secs",
+            default_alarm_dedup_window_secs(),
+        )?
         .set_default("log_format_json", false)?
         .set_default("allowed_origins", "")?
         .build()?;
@@ -351,6 +406,33 @@ mod log_filter_tests {
             build_env_filter("Sky Moon Scope_core=not_a_real_level").to_string(),
             "info"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_redaction_tests {
+    use super::redact_sensitive_values;
+    use serde_json::json;
+
+    #[test]
+    fn masks_sensitive_environment_suffixes_and_preserves_other_values() {
+        let mut value = json!({
+            "database_url": "postgres://user:password@example/db",
+            "rpc_key": "rpc-secret",
+            "webhook_secret": "webhook-secret",
+            "admin_password": "admin-password",
+            "server_port": 8080,
+            "nested": {"signing_key": "nested-secret"}
+        });
+
+        redact_sensitive_values(&mut value);
+
+        assert_eq!(value["database_url"], "[REDACTED]");
+        assert_eq!(value["rpc_key"], "[REDACTED]");
+        assert_eq!(value["webhook_secret"], "[REDACTED]");
+        assert_eq!(value["admin_password"], "[REDACTED]");
+        assert_eq!(value["server_port"], 8080);
+        assert_eq!(value["nested"]["signing_key"], "[REDACTED]");
     }
 }
 
@@ -452,6 +534,8 @@ pub struct AppState {
     metrics: Arc<AppMetrics>,
     /// WebSocket event bus for simulation jobs.
     simulation_bus: Arc<SimulationBus>,
+    /// Stellar network passphrase (used for cache key generation)
+    network_passphrase: String,
 }
 
 #[derive(Clone)]
@@ -966,8 +1050,12 @@ async fn analyze(
     tracing::info!("Received analyze request");
 
     let args = payload.args.clone().unwrap_or_default();
-    let cache_key =
-        SimulationCache::generate_key(&payload.contract_id, &payload.function_name, &args);
+    let cache_key = SimulationCache::generate_key_with_network(
+        &payload.contract_id,
+        &payload.function_name,
+        &args,
+        &state.network_passphrase,
+    );
 
     // Track simulation latency
     let start_time = std::time::Instant::now();
@@ -1266,9 +1354,19 @@ async fn analyze_wasm_profile(
 
     let result = tokio::time::timeout(
         state.simulation_timeout,
-        tokio::task::spawn_blocking(move || {
-            simulation::profile_contract_with_flamegraph(wasm_bytes, function_name, args)
-        }),
+        state
+            .event_worker_pool
+            .spawn_blocking(move || {
+                simulation::profile_contract_with_flamegraph(wasm_bytes, function_name, args)
+            })
+            .map_err(|error| match error {
+                crate::worker_pool::TaskQueueError::Full => AppError::TooManyRequests(
+                    "The event worker queue is full; please retry later".to_string(),
+                ),
+                crate::worker_pool::TaskQueueError::Closed => {
+                    AppError::Internal("The event worker queue is closed".to_string())
+                }
+            })?,
     )
     .await
     .map_err(|_| {
@@ -1410,6 +1508,7 @@ pub struct CompareApiResponse {
     responses(
         (status = 200, description = "Comparison report", body = CompareApiResponse),
         (status = 400, description = "Invalid request"),
+        (status = 404, description = "Baseline snapshot not found"),
         (status = 500, description = "Comparison failed")
     ),
     tag = "Analysis"
@@ -1527,9 +1626,10 @@ async fn compare_handler(
         }
     };
 
-    let report = comparison::run_comparison(&state.engine, compare_mode)
-        .await
-        .map_err(|e| AppError::Internal(format!("Comparison failed: {}", e)))?;
+    // `?` converts `ComparisonError` into `AppError` via the crate's `From`
+    // impl, so a missing baseline snapshot surfaces as `404 Not Found` instead
+    // of a generic `500`.
+    let report = comparison::run_comparison(&state.engine, compare_mode).await?;
 
     Ok(Json(CompareApiResponse { report }))
 }
@@ -2013,11 +2113,8 @@ async fn main() {
         .with(build_env_filter(&config.rust_log))
 
     tracing::info!(rust_log = %config.rust_log, "Sky Moon Scope Starting...");
-    tracing::info!("Sky Moon Scope initialized with config: {:?}", config);
-    tracing::info!(
-        redis_url = %config.redis_url,
-        "Cache config: using in-memory (moka) MVP; Redis URL reserved for future migration"
-    );
+    tracing::info!("Sky Moon Scope initialized with config: {:?}", redacted_config(&config));
+    tracing::info!("Cache config: using in-memory (moka) MVP; Redis URL reserved for future migration");
     if config.inbound_webhook_secret.is_empty() {
         tracing::warn!(
             "Inbound webhook secret is not configured; set INBOUND_WEBHOOK_SECRET or SKY_MOON_SCOPE_INBOUND_WEBHOOK_SECRET"
@@ -2182,7 +2279,7 @@ async fn main() {
                 comparison::print_report(&report);
             }
             Err(e) => {
-                eprintln!("Error: Comparison failed: {}", e);
+                eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
@@ -2618,7 +2715,8 @@ async fn main() {
 
     // ── Persistent Cache Setup (L2) ─────────────────────────────────────
     let sled_db = sled::open("sky_moon_scope_cache").expect("Failed to open sled database");
-    let simulation_cache = SimulationCache::new(&sled_db);
+    let simulation_cache =
+        SimulationCache::new_with_max_cache_size_mb(&sled_db, config.max_cache_size_mb);
     let contract_cache = Arc::new(ContractCache::new(&sled_db));
 
     let app_metrics = Arc::new(
@@ -2642,6 +2740,7 @@ async fn main() {
         metrics: Arc::clone(&app_metrics),
         metrics,
         simulation_bus,
+        network_passphrase: config.network_passphrase.clone(),
     });
 
     // ── Issue #592: System Resource Alarm Monitor ────────────────────────
@@ -2652,11 +2751,20 @@ async fn main() {
     // triggered hysteresis so a sustained saturation produces exactly
     // one breach notification (plus a recovery notification when the
     // resource drops back below threshold).
-    let alarm_config = crate::sys_alarms::SysAlarmConfig::from_env();
+    //
+    // Issue #24: the edge trigger fires on *every* crossing, so a resource
+    // flapping around the threshold would alert once per sample. The
+    // deduplication window (config: `alarm_dedup_window_secs`) caps that at
+    // one alert per resource per window.
+    let alarm_config = crate::sys_alarms::SysAlarmConfig::from_env()
+        .with_dedup_window_secs(config.alarm_dedup_window_secs);
     let alarm_monitor = crate::sys_alarms::SysAlarmMonitor::new(alarm_config)
         .with_metrics(Arc::clone(&app_metrics));
     if let Some(_alarm_handle) = alarm_monitor.spawn() {
-        tracing::info!("System resource alarm monitor spawned (issue #592)");
+        tracing::info!(
+            alarm_dedup_window_secs = config.alarm_dedup_window_secs,
+            "System resource alarm monitor spawned (issue #592)"
+        );
     }
     // Clone the bus Arc before app_state is moved into the router, so the gRPC
     // server can subscribe to the same broadcast channel.
@@ -2721,8 +2829,7 @@ async fn main() {
         .route("/fees/recommend", get(fee_recommend))
         .route("/fees/history", get(fee_history))
         .route("/fees/analytics", get(fee_analytics))
-        // WebSocket streaming (Issue #105) — no auth required on the upgrade;
-        // the client passes the job_id in the path.
+        // WebSocket streaming (Issue #105) authenticates during the upgrade.
         .route("/ws/jobs/:job_id", get(ws::ws_handler))
         // Inbound webhooks signature validation (Issue #582)
         .route("/api/v1/webhooks/incoming", post(incoming_webhook))
@@ -2731,6 +2838,7 @@ async fn main() {
         .layer(Extension(webhook_validation::InboundWebhookSecret(Arc::new(
             config.inbound_webhook_secret.clone(),
         ))))
+        .layer(Extension(webhook_validation::InboundWebhookNonceCache::default()))
         // GraphQL contract execution history + token metadata query layer.
         .route(
             "/graphql",
@@ -2740,6 +2848,10 @@ async fn main() {
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        // ── Error sanitization middleware (#error-security) ─────────────────
+        // Replaces 5xx error details with opaque messages while logging
+        // full Debug details server-side to prevent information leakage.
+        .layer(middleware::from_fn(error_middleware::error_sanitization_middleware))
         // ── x-request-id (#572) ───────────────────────────────────────
         // Assigns a UUID to every inbound request under the `x-request-id`
         // header and propagates it to outbound responses so clients can
@@ -3030,10 +3142,18 @@ mod tests {
         let event_pool = Arc::new(EventWorkerPool::new(4).unwrap());
         let app_state = Arc::new(AppState {
             engine: SimulationEngine::new("https://test.example.com".to_string()),
+            provider_registry: Arc::new(ProviderRegistry::new(Default::default())),
             cache: SimulationCache::new(),
             insights_engine: InsightsEngine::new(),
+            gas_golfing_analyzer: GasGolfingAnalyzer::new(),
             simulation_timeout: std::time::Duration::from_secs(30),
+            job_queue: JobQueue::new(10),
             event_worker_pool: Arc::clone(&event_pool),
+            fee_analytics_engine: FeeAnalyticsEngine::new(),
+            fee_store: Arc::new(FeeStore::new()),
+            metrics: Arc::new(AppMetrics::new().unwrap()),
+            simulation_bus: Arc::new(SimulationBus::new(100)),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
         });
         let auth_state = Arc::new(auth::AuthState::new(
             "test-secret".to_string(),
@@ -3049,6 +3169,7 @@ mod tests {
             .merge(protected)
             .layer(Extension(auth_state))
             .layer(Extension(webhook_validation::InboundWebhookSecret(webhook_secret)))
+            .layer(Extension(webhook_validation::InboundWebhookNonceCache::default()))
             .with_state(app_state)
     }
 
@@ -3201,5 +3322,3 @@ async fn analyze_simulation(
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
 }
-
-```
