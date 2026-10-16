@@ -1,0 +1,15 @@
+[package]
+name = "clips"
+description = "Soroban Clips NFT Contract with royalty and approval authorization"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk.workspace = true
+
+[dev-dependencies]
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
